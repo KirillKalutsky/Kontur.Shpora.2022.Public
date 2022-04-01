@@ -15,58 +15,91 @@ namespace ClusterTests
 
     public class RoundRobinClusterClient : ClusterClientBase
     {
-        private readonly Dictionary<string, List<long>> previousAttempts = new();
-        private readonly Dictionary<string, int> notWorkinh = new();
-        private readonly Stopwatch timer = new();
+        private const int historyLength = 100;
+        private readonly Dictionary<string, Queue<long>> previousAttempts;
+
         public RoundRobinClusterClient(string[] replicaAddresses)
             : base(replicaAddresses)
         {
-            
+            previousAttempts = new(replicaAddresses.Length);
         }
 
         public override async Task<string> ProcessRequestAsync(string query, TimeSpan timeout)
         {
-            var dt = timeout / ReplicaAddresses.Length;
-            IEnumerable<string> addresses;
-           
-            lock (previousAttempts)
+            var taskTimer = new Stopwatch();
+            var replicaCount = ReplicaAddresses.Length;
+            var timeoutTimer = new Stopwatch();
+            var exceptions = new List<Exception>();
+            var addresses = GetOptimalReplicaOrder();
+
+            timeoutTimer.Start();
+
+            foreach (var address in addresses)
             {
-                addresses = previousAttempts.OrderBy(x => x.Value.Sum() / x.Value.Count)
-                    .Select(x => x.Key)
-                    .Concat(ReplicaAddresses.Where(x => !previousAttempts.ContainsKey(x)));
+                var timeLimit = (timeout - timeoutTimer.Elapsed) / replicaCount;
+                if(timeLimit.TotalMilliseconds == 0)
+                    break;
+                replicaCount--;
+
+                var webRequest = CreateRequest(address + "?query=" + query);
+                var request = ProcessRequestAsync(webRequest);
+
+                taskTimer.Start();
+                await Task.WhenAny(request, Task.Delay(timeLimit));
+                taskTimer.Stop();
+
+                WriteTime(address, taskTimer.ElapsedMilliseconds);
+
+                if (!request.IsCompleted)
+                    continue;
+
+                if (request.IsCompletedSuccessfully)
+                    return await request;
+                
+                exceptions.Add(request.Exception);
             }
 
-            foreach (var add in addresses)
+            if (exceptions.Any())
             {
-                var webRequest = CreateRequest(add + "?query=" + query);
-
-                Task<string> resultTask = ProcessRequestAsync(webRequest);
-
-                timer.Start();
-                await Task.WhenAny(resultTask, Task.Delay(dt));
-                timer.Stop();
-
-                var time = timer.ElapsedMilliseconds;
-                if (!resultTask.IsCompleted || resultTask.Status == TaskStatus.Faulted)
-                    time = (long) timeout.TotalMilliseconds;
-
-                lock (previousAttempts)
-                {
-                    if (previousAttempts.ContainsKey(add)) 
-                        previousAttempts[add].Add(time);
-                    
-                    else
-                        previousAttempts[add] = new List<long> { time };
-                }
-
-                if (resultTask.IsCompleted && resultTask.Status != TaskStatus.Faulted)
-                {
-                    return await resultTask;
-                }
-                    
+                exceptions.Add(new TimeoutException());
+                throw new AggregateException(exceptions);
             }
 
             throw new TimeoutException();
+        }
+
+        private void WriteTime(string address, long workTime)
+        {
+            lock (previousAttempts)
+            {
+                if (previousAttempts.ContainsKey(address))
+                {
+                    if(previousAttempts.Count < historyLength)
+                        previousAttempts[address].Enqueue(workTime);
+                    else
+                    {
+                        previousAttempts[address].Dequeue();
+                        previousAttempts[address].Enqueue(workTime);
+                    }
+                }
+                else
+                {
+                    var newHistory = new Queue<long>(historyLength);
+                    newHistory.Enqueue(workTime);
+                    previousAttempts[address] = newHistory;
+                }
+            }
+        }
+
+        private IEnumerable<string> GetOptimalReplicaOrder()
+        {
+            lock (previousAttempts)
+            {
+                return previousAttempts
+                    .OrderBy(pair => pair.Value.Sum() / pair.Value.Count)
+                    .Select(pair => pair.Key)
+                    .Concat(ReplicaAddresses.Where(addr => !previousAttempts.ContainsKey(addr)));
+            }
         }
 
         protected override ILog Log => LogManager.GetLogger(typeof(RoundRobinClusterClient));
